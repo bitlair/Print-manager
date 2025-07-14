@@ -1,4 +1,5 @@
 import { Client } from 'ssh2';
+import Config from './config.js';
 
 export default class BitlairBank
 {
@@ -36,16 +37,19 @@ export default class BitlairBank
 				stream.write(username + '\n');
 			});
 		}).connect({
-			host: 'bank.bitlair.nl',
-			username: 'bank',
-			password: 'bank'
+			host: 		Config.BANK_HOST,
+			username: 	Config.BANK_USERNAME,
+			password: 	Config.BANK_PASSWORD
 		});
 	}
 }
 
 console.log('BITLAIRBANK INIT');
-let test = new BitlairBank();
 
-/*setTimeout(() => {
-	test.pay3DPrint(1);
+
+
+/*
+let test = new BitlairBank();
+setTimeout(() => {
+	test.pay3DPrint(1, 'djo');
 }, 5000);*/

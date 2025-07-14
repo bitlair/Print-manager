@@ -8,11 +8,16 @@ import { promises as fs } from 'fs';
 import { Server as SocketServer } from 'socket.io';
 import path from 'path';
 import unzipper from 'unzipper';
+import { Worker } from 'worker_threads';
+import { fileURLToPath } from 'url';
+import Config from './config.js'; 
+import { time_to_minutes, is_empty } from './utils.js';
+
 import BitlairBank from './ssh.js';
 import OneWire from './onewire.js';
 
 // disable self cert
-process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = 0;
+process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = 0; 
 
 // getGcodeInformation('./d1_colored.gcode').then((data) => {
 // 	console.log('d1_colored.gcode', data);
@@ -22,48 +27,14 @@ process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = 0;
 // 	console.log('d1_colored.gcode', data);
 // });
 
-const DEBUGGING 				= process.env.NODE_ENV === 'development';
 const CLIENT_ID 				= 'nodejs-client-' + Math.random().toString(16).substr(2, 8);
 const TIME_BETWEEN_COMMANDS_MS 	= 100;
-const BUFFER_MINUTES_TIME_DJO 	= 30;
 const BITLAIR_BANK 				= new BitlairBank();
 const IBUTTON_READER 			= new OneWire();
 
 console.log("Starting", isWithinDjoTime() ? " DJO tijd" : "bitlair tijd");
 
-const PRINTERS = [
-	{
-		ip: 		'bambu1.bitlair.nl',
-		username: 	'bblp',
-		password: 	'',
-		serial: 	'',
-		title: 		'Bambu P1S #1',
-	},
-	{
-		ip: 		'bambu2.bitlair.nl',
-		username: 	'bblp',
-		password: 	'',
-		serial: 	'',
-		title: 		'Bambu P1S #2',
-	},
-	{
-		ip: 		'bambu3.bitlair.nl',
-		username: 	'bblp',
-		password: 	'',
-		serial: 	'',
-		title: 		'Bambu P1S #3',
-	},
-	{
-		ip: 		'bambu4.bitlair.nl',
-		username: 	'bblp',
-		password: 	'',
-		serial: 	'',
-		title: 		'Bambu X1C',
-	},
-];
-
-
-
+const PRINTERS = _.cloneDeep(Config.PRINTERS);
 
 // Get the current directory path in ES modules
 const __dirname = path.dirname(new URL(import.meta.url).pathname);
@@ -130,6 +101,11 @@ io.on('connection', socket => {
 			last_authenticated_user = {id: device_id, username: 'DJO'};
 			socket.emit('user authenticated', 'DJO');
 		}
+		else
+		{
+			//last_authenticated_user = {id: device_id, username: '-1'};
+			socket.emit('user authenticated', '-1');
+		}
 	});
 
     socket.on('message', data => {
@@ -170,13 +146,17 @@ io.on('connection', socket => {
 			// resetten, they performed the action they authenticated for
 			last_authenticated_user = undefined;
 			
-			sendResumeCommand(printer.mqtt_client, printer.serial); 
+			if(isWithinDjoTime)
+				sendResumeCommand(printer.mqtt_client, printer.serial); 
+			
 			updateClientPrinterData();
 		}
 	});
 	
 	// push latest info to the new client
 	updateClientPrinterData(socket);
+	
+	socket.emit('update djo time minutes', Config.DJO_TIME_MINUTES);
 
     socket.on('disconnect', () => {
         console.log('user disconnected:', socket.id);
@@ -223,6 +203,8 @@ function getFtpClient(printer)
 
 _.each(PRINTERS, (printer, printer_index) => {
 	let total_payload = {};
+	let initialized = false;
+	let refresh_requested = false;
 	
 	printer.last_accepted_md5 = undefined;
 
@@ -254,7 +236,9 @@ _.each(PRINTERS, (printer, printer_index) => {
 				}
 			});
 			
-			sendRefreshCommand(printer.mqtt_client, printer.serial);
+			sendRefreshCommand(printer.mqtt_client, printer.serial).then(() => {
+				refresh_requested = true;
+			});
 		});
 
 		printer.mqtt_client.on('message', (topic, message) => {
@@ -293,8 +277,7 @@ _.each(PRINTERS, (printer, printer_index) => {
 						
 						printer.last_paid_for_md5 = total_payload.print.md5;
 						
-						
-						fs.appendFile('printer_paid_log.log', getDateAndTime() + 'Paid for the weight of ' + printer.gcode_information.weight + ' for the user ' + printer.last_accepted_by_user + ' \n\n\n', 'utf8', (err) => {
+						fs.appendFile('printer_paid_log.log', getDateAndTime() + 'Paid for the weight of ' + printer.gcode_information.weight + ' for the user ' + printer.last_accepted_by_user.username + ' (' + printer.last_accepted_by_user.id + ') \n\n\n', 'utf8', (err) => {
 							if (err) {
 								console.error('Error appending to file:', err);
 							} else {
@@ -303,10 +286,10 @@ _.each(PRINTERS, (printer, printer_index) => {
 						});
 					}
 				}
-
+				
 				// todo check when a new print is executed
 				if(
-					(total_payload.print.gcode_state == "FINISH" || total_payload.print.gcode_state == "RUNNING") &&
+					(total_payload.print.gcode_state == "FINISH" || total_payload.print.gcode_state == "RUNNING" || !initialized) &&
 					(
 						!printer.gcode_information ||
 						(
@@ -314,44 +297,7 @@ _.each(PRINTERS, (printer, printer_index) => {
 							printer.gcode_information.last_file != total_payload.print.subtask_name
 						)
 					)
-				) {
-					/*
-					if(total_payload.print.param && total_payload.print.file)
-					{
-						const plate_number 				= total_payload.print.param.split('plate_')[1].replace('.gcode', '');
-						const expected_gcode_filename 	= 'cache/' + total_payload.print.file.split('.gcode')[0] + '_plate_' + plate_number + '.gcode';
-						const local_filename 			= './latest_print_' + printer_index + '.gcode';
-						
-						printer.gcode_information = {
-							last_file: total_payload.print.file
-						};
-						
-						console.log("TRYING TO LOAD FTP 1");
-						
-						try {
-							if(ftp_client)
-							{
-								ftp_client.downloadTo(local_filename, expected_gcode_filename).then(() => {
-									getGcodeInformation(local_filename).then((gcode_information) => {
-										printer.gcode_information = gcode_information;
-										printer.gcode_information.last_file = total_payload.print.file;
-										slowedUpdateClientPrinterData();
-									}).catch((error) => {
-										console.log('FTP parse failed!', error); 
-									});
-								}).catch((error) => {
-									console.log('FTP download to failed!', error);
-								});
-							}
-						}
-						catch (exception)
-						{
-							console.log('FTP failed to retrieve for printer ', printer.title, ' with exception ', exception);
-							printer.gcode_information = undefined;
-						}
-					}
-					*/
-					
+				) {  
 					if(total_payload.print.subtask_name)
 					{
 						const local_filename = './latest_print_' + printer_index + '.gcode.3mf';
@@ -375,7 +321,7 @@ _.each(PRINTERS, (printer, printer_index) => {
 									{
 										try {
 											ftp_client.downloadTo(local_filename, matchedFile.name).then(() => {
-												extractPlateGcode(local_filename).then((content) => {
+												/*extractPlateGcode(local_filename).then((content) => {
 													const gcode_information = getGcodeInformationFromContent(content);
 													
 													printer.gcode_information 			= gcode_information;
@@ -387,7 +333,25 @@ _.each(PRINTERS, (printer, printer_index) => {
 													console.log('FTP extractPlateGcode failed', exception); 
 													printer.gcode_information = undefined;
 													ftp_client.close();
+												});*/
+												
+												readPrinterFile(local_filename).then(data => {
+													if(data.status)
+													{
+														printer.gcode_information 			= data;
+														printer.gcode_information.last_file = total_payload.print.subtask_name;
+														
+														slowedUpdateClientPrinterData();
+													}
+													
+													console.log('Parsed data from worker:', data);
+												})
+												.catch(err => {
+													console.error('Worker error:', err);
+													printer.gcode_information = undefined;
 												});
+												
+												ftp_client.close();
 											}).catch((exception) => {
 												console.log('FTP downloadTo failed', exception);
 												printer.gcode_information = undefined;
@@ -425,6 +389,10 @@ _.each(PRINTERS, (printer, printer_index) => {
 					printer.last_print.title = total_payload.print.subtask_name;
 
 				slowedUpdateClientPrinterData();
+				
+				// set initialized so we know this is the refreshed data
+				if(!initialized && refresh_requested)
+					initialized = true;
 			} catch (err) {
 				console.log('MQTT message error: ', err);
 			}
@@ -503,7 +471,7 @@ function sendCommand(mqtt_client, serial, command, params) {
 	});
 }
 
-function sendRefreshCommand(mqtt_client, serial)
+/*function sendRefreshCommand(mqtt_client, serial)
 {
 	const topic = `device/${serial}/request`;  // This is typically the topic for G-code commands
 
@@ -522,8 +490,40 @@ function sendRefreshCommand(mqtt_client, serial)
 			console.log(`✅ Sent command: REFRESH`);
 		}
 	});
+}*/
+
+function sendRefreshCommand(mqtt_client, serial)
+{
+	return new Promise((resolve, reject) => {
+		const topic = `device/${serial}/request`;
+
+		const payload = JSON.stringify({
+			"pushing": {
+				"sequence_id": "0",
+				"command": "pushall",
+				"version": 1,
+				"push_target": 1
+			}
+		});
+
+		mqtt_client.publish(topic, payload, (err) => {
+			if (err) {
+				console.error('❌ Failed to send REFRESH command:', err);
+				reject(err);
+			} else {
+				console.log(`✅ Sent command: REFRESH`);
+				resolve();
+			}
+		});
+	});
 }
 
+function getDateAndTime() {
+  const now = new Date();
+  return now.toISOString().replace('T', ' ').substring(0, 19);
+}
+
+/*
 function getGcodeInformationFromContent(content)
 {
 	const lines = content.split('\n');
@@ -589,11 +589,6 @@ function convertToSeconds(timeString) {
   }
 }
 
-function getDateAndTime() {
-  const now = new Date();
-  return now.toISOString().replace('T', ' ').substring(0, 19);
-}
-
 function sumWeightValues(valueString) {
   // Split the string by commas and parse the individual numbers
   const values = valueString.split(',').map(value => parseFloat(value.trim()));
@@ -601,13 +596,15 @@ function sumWeightValues(valueString) {
   // Sum all the parsed values
   return values.reduce((sum, value) => sum + value, 0).toFixed(2);
 }
+*/
+
 
 // code to go through the whole gcode and calculate weight and time based on it
 /*
 function getGcodeInformation(filePath) {
     return fs.readFile(filePath, 'utf8').then((gcode) => {
         const lines = gcode.split('\n');
-
+  
         let totalExtruded = 0;
         let isRelativeMode = false;
 		let lastE = null; // Add this at the top
@@ -779,7 +776,7 @@ function updateClientPrinterData(socket = undefined)
 	*/
 }
 
-function extractPlateGcode(filePath)
+/*function extractPlateGcode(filePath)
 {
 	console.log('extractPlateGcode', filePath);
 	
@@ -795,6 +792,21 @@ function extractPlateGcode(filePath)
 	}).then((content) => {
 		return content.toString('utf8');
 	});
+}*/
+
+function readPrinterFile(filePath) {
+    return new Promise((resolve, reject) => {
+        const worker = new Worker(path.resolve(__dirname, 'gcodeParser.js'), {
+            workerData: filePath
+        });
+
+        worker.on('message', resolve);
+        worker.on('error', reject);
+        worker.on('exit', code => {
+            if (code !== 0)
+                reject(new Error(`Worker stopped with exit code ${code}`));
+        });
+    });
 }
 
 
@@ -807,51 +819,13 @@ function extractPlateGcode(filePath)
 // same one as in the app.tsx for the interface
 function isWithinDjoTime()
 {
-	if(DEBUGGING)
+	if(Config.DEBUGGING)
 		return true;
 
 	const now = moment();
 	const iso_day = now.isoWeekday();
-	const is_djo_day = iso_day == 5 || iso_day == 6; // 1 = monday, 7 = sunday
-	const djo_time_minutes = {
-		// 3: {
-		// 	start_time: time_to_minutes('11:32') - BUFFER_MINUTES_TIME_DJO,
-		// 	end_time: 	time_to_minutes('22:00') + BUFFER_MINUTES_TIME_DJO,
-		// },
-		5: {
-			start_time: time_to_minutes('19:00') - BUFFER_MINUTES_TIME_DJO,
-			end_time: 	time_to_minutes('22:00') + BUFFER_MINUTES_TIME_DJO,
-		},
-		6: {
-			start_time: time_to_minutes('09:30') - BUFFER_MINUTES_TIME_DJO,
-			end_time: 	time_to_minutes('13:30') + BUFFER_MINUTES_TIME_DJO,
-		},
-	}
 	const current_time_minutes = time_to_minutes(now.format('HH:mm'));
 
-	return (is_djo_day && current_time_minutes >= djo_time_minutes[iso_day].start_time && current_time_minutes <= djo_time_minutes[iso_day].end_time);
+	return (Config.DJO_TIME_MINUTES[iso_day] && current_time_minutes >= Config.DJO_TIME_MINUTES[iso_day].start_time && current_time_minutes <= Config.DJO_TIME_MINUTES[iso_day].end_time);
 }
 
-function time_to_minutes(time)
-{
-    time = time.split(':');
-
-    return (parseInt(time[0])*60) + parseInt(time[1]);
-};
-
-function is_empty(val)
-{
-	if (val === null || typeof val == 'undefined')
-		return true;
-
-	if (typeof val == 'string')
-		return val.trim().length == 0;
-
-	if (typeof val == 'function' || typeof val == 'number' || typeof val == 'boolean')
-		return false;
-
-	if (typeof val == 'object')
-		return _.isEmpty(val);
-
-	return true;
-};
