@@ -1,8 +1,11 @@
 
 import unzipper from 'unzipper';
 import { workerData, parentPort } from 'worker_threads';
-import { readFile } from 'fs/promises';
+import { readFile, writeFile, mkdir } from 'fs/promises';
+import fs from 'fs/promises';
 import _ from 'lodash';
+import path from 'path';
+
 
 function extractPlateGcode(filePath)
 {
@@ -21,6 +24,75 @@ function extractPlateGcode(filePath)
 		return content.toString('utf8');
 	});
 }
+
+function extractPlatePreview(filePath) {
+    console.log('extractPlatePreview', filePath);
+
+    return readFile(filePath).then(buffer => {
+        const pngMagic = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]); // PNG header
+        const iendMagic = Buffer.from([0x49, 0x45, 0x4E, 0x44]); // IEND
+
+        // Simple buffer search function
+        function indexOfBuffer(buf, sub, start = 0) {
+            for (let i = start; i <= buf.length - sub.length; i++) {
+                let match = true;
+                for (let j = 0; j < sub.length; j++) {
+                    if (buf[i + j] !== sub[j]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) return i;
+            }
+            return -1;
+        }
+
+        // Search for any plate_*.png filename in the buffer (ASCII only)
+        const filenameRegex = /plate_[^\/\s]+\.png/; // matches plate_no_light_1.png, etc.
+        const asciiStr = buffer.toString('ascii'); // safe for ASCII filenames only
+        const filenameMatch = asciiStr.match(filenameRegex);
+
+        if (!filenameMatch) {
+            console.log('No plate PNG filename found');
+            return null;
+        }
+
+        const filename = filenameMatch[0];
+
+        // Convert filename position to buffer offset
+        const filenameBuf = Buffer.from(filename, 'ascii');
+        const startSearch = indexOfBuffer(buffer, filenameBuf, 0);
+
+        if (startSearch === -1) {
+            console.log('Filename buffer not found');
+            return null;
+        }
+
+        // Search for PNG header after the filename
+        const startIdx = indexOfBuffer(buffer, pngMagic, startSearch);
+        if (startIdx === -1) {
+            console.log('PNG header not found');
+            return null;
+        }
+
+        // Search for IEND chunk to find the end of the PNG
+        const iendIdx = indexOfBuffer(buffer, iendMagic, startIdx);
+        if (iendIdx === -1) {
+            console.log('IEND chunk not found');
+            return null;
+        }
+
+        const endIdx = iendIdx + 12; // IEND chunk is 12 bytes
+        const pngBuffer = buffer.slice(startIdx, endIdx);
+
+        return {
+            filename,
+            base64: pngBuffer.toString('base64')
+        };
+    });
+}
+
+
 
 function getGcodeInformationFromHeaders(content)
 {
@@ -238,8 +310,6 @@ function sumWeightValues(valueString) {
   return parseFloat(values.reduce((sum, value) => sum + value, 0).toFixed(2));
 }
 
-
-
 try {
     try {
         console.log('worker initialized');
@@ -254,7 +324,14 @@ try {
 			else
 				response_data.parsed_by = 'headers';
 			
-			parentPort.postMessage({ status: true, ...response_data });
+			response_data.filename = workerData.replace('./', '');
+			
+			extractPlatePreview(workerData).then(preview_response => {
+				if(preview_response)
+					response_data.preview_image_base64 = preview_response.base64;
+				
+				parentPort.postMessage({ status: true, ...response_data });
+			});
 		})
     } catch (error) {
 		console.log(error);

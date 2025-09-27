@@ -19,7 +19,7 @@ import OneWire from './onewire.js';
 // disable self cert
 process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = 0; 
 
-// getGcodeInformation('./d1_colored.gcode').then((data) => {
+// getGcodeInformation('./d1_colored.gcode').then((data) => {             
 // 	console.log('d1_colored.gcode', data);
 // });
 
@@ -31,6 +31,7 @@ const CLIENT_ID 				= 'nodejs-client-' + Math.random().toString(16).substr(2, 8)
 const TIME_BETWEEN_COMMANDS_MS 	= 100;
 const BITLAIR_BANK 				= new BitlairBank();
 const IBUTTON_READER 			= new OneWire();
+const USE_DUMMY_DATA			= false;
 
 console.log("Starting", isWithinDjoTime() ? " DJO tijd" : "bitlair tijd");
 
@@ -61,15 +62,43 @@ const serveStaticFile = (filePath, res) => {
         });
 };
 
+// readPrinterFile('./latest_print_0.gcode.3mf').then((gcode_response) => {
+	// console.log('gcode_response', gcode_response);                           
+// })
+
+
 
 const http_server = http.createServer(function (req, res) {
-	// Normalize the request URL to always serve the public folder as root
+    // Enable CORS for all origins (or restrict to your frontend URL)
+    res.setHeader('Access-Control-Allow-Origin', '*'); // or 'http://192.168.2.34:3000'
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    // Handle preflight request
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
+	     
+	// Normalize the request URL
     const requestPath = req.url === '/' ? '/index.html' : req.url;
 
-    // Construct the full file path from the public folder
-    const filePath = path.join(__dirname, 'public', requestPath);
+    let filePath;
+	
+	console.log('requestPath', requestPath);
+	
+    if (requestPath.endsWith('.3mf')) {
+        // Serve 3MF files from ../Print-manager/
+        const fileName = path.basename(requestPath); // extract just the filename
+        filePath = path.join(__dirname, '..', 'Print-manager', fileName);
+    } else {
+        // Serve other files from public folder
+        filePath = path.join(__dirname, 'public', requestPath);
+    }
+
     // Serve the requested file (or 404 if it doesn't exist)
-    serveStaticFile(filePath, res);
+    serveStaticFile(filePath, res);  
 });//.listen(8080); //the server object listens on port 8080
 
 const io = new SocketServer(http_server, {
@@ -91,6 +120,7 @@ let socket_selected_printer_serials = {};
 let last_authenticated_user = undefined;
 
 io.on('connection', socket => {
+	
     console.log('a user connected:', socket.id);
 	
 	socket_selected_printer_serials[socket.id] = undefined;
@@ -219,6 +249,21 @@ _.each(PRINTERS, (printer, printer_index) => {
 
 	const slowedUpdateClientPrinterData = _.throttle(updateClientPrinterData, 2000);
 
+	if(USE_DUMMY_DATA)
+	{
+		if(!printer.gcode_information)
+			readPrinterFile('./latest_print_' + printer_index + '.gcode.3mf').then((data) => {
+				
+				printer.gcode_information 			= data;
+				printer.gcode_information.last_file = "test";
+				printer.last_print = {title: data.filename};
+				
+				slowedUpdateClientPrinterData();                    
+			});
+		printer.last_print = {title: 'test.png'}
+		printer.state = 'RUNNING';
+	}
+	
 	try {
 		// Connect to the printer's MQTT broker
 		printer.mqtt_client = mqtt.connect(`mqtts://${printer.ip}:8883`, options);
