@@ -1,5 +1,6 @@
 import { Client } from 'ssh2';
 import Config from './config.js';
+import fs from 'fs';
 
 export default class BitlairBank
 {
@@ -39,7 +40,9 @@ export default class BitlairBank
 		}).connect({
 			host: 		Config.BANK_HOST,
 			username: 	Config.BANK_USERNAME,
-			password: 	Config.BANK_PASSWORD
+			privateKey: fs.readFileSync(Config.BANK_PRIVATE_KEY_PATH), // path to your private key
+			passphrase:	Config.BANK_PASSPHRASE,
+			//password: 	Config.BANK_PASSWORD
 		});
 	}
 }

@@ -34,9 +34,10 @@ export default {
 			title: 		'Bambu X1C',
 		},
 	],
-	BANK_HOST: 		'bank.bitlair.nl',
-	BANK_USERNAME: 	'',
-	BANK_PASSWORD: 	'',
+	BANK_HOST: 				'bank.bitlair.nl',
+	BANK_USERNAME: 			'',
+	BANK_PASSPHRASE:		'',
+	BANK_PRIVATE_KEY_PATH:	'',
 	DJO_TIME_MINUTES: {
 		// vrijdag
 		5: {
