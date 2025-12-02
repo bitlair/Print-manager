@@ -27,11 +27,12 @@ process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = 0;
 // 	console.log('d1_colored.gcode', data);
 // });
 
-const CLIENT_ID 				= 'nodejs-client-' + Math.random().toString(16).substr(2, 8);
-const TIME_BETWEEN_COMMANDS_MS 	= 100;
-const BITLAIR_BANK 				= new BitlairBank();
-const IBUTTON_READER 			= new OneWire();
-const USE_DUMMY_DATA			= false;
+const CLIENT_ID 					= 'nodejs-client-' + Math.random().toString(16).substr(2, 8);
+const TIME_BETWEEN_COMMANDS_MS 		= 100;
+const BITLAIR_BANK 					= new BitlairBank();
+const IBUTTON_READER 				= new OneWire();
+const USE_DUMMY_DATA				= false;
+const PROCESSING_TIMEOUT_SECONDS	= 30;
 
 console.log("Starting", isWithinDjoTime() ? " DJO tijd" : "bitlair tijd");
 
@@ -235,7 +236,9 @@ _.each(PRINTERS, (printer, printer_index) => {
 	let total_payload = {};
 	let initialized = false;
 	let refresh_requested = false;
+	let processing_new_print_timeout = undefined;
 	
+	printer.processing_new_print = false;
 	printer.last_accepted_md5 = undefined;
 
 	// MQTT connection options for Bambu printer
@@ -364,6 +367,20 @@ _.each(PRINTERS, (printer, printer_index) => {
 									
 									if (matchedFile)
 									{
+										printer.processing_new_print = true;
+										slowedUpdateClientPrinterData();
+										
+										if(processing_new_print_timeout)
+											clearTimeout(processing_new_print_timeout);
+										
+										// timeout just in case there is any failure or it just takes ages for very complex prints
+										processing_new_print_timeout = setTimeout(() => {
+											printer.processing_new_print = false;
+											processing_new_print_timeout = undefined;
+											slowedUpdateClientPrinterData();
+											console.log('Processing timeout reached for printer ', printer.title);
+										}, PROCESSING_TIMEOUT_SECONDS * 1000);
+										
 										try {
 											ftp_client.downloadTo(local_filename, matchedFile.name).then(() => {
 												/*extractPlateGcode(local_filename).then((content) => {
@@ -386,20 +403,29 @@ _.each(PRINTERS, (printer, printer_index) => {
 														printer.gcode_information 			= data;
 														printer.gcode_information.last_file = total_payload.print.subtask_name;
 														
-														slowedUpdateClientPrinterData();
 													}
+													
+													if(processing_new_print_timeout)
+														clearTimeout(processing_new_print_timeout);
+													
+													printer.processing_new_print = false;
+													processing_new_print_timeout = undefined;
+													slowedUpdateClientPrinterData();
 													
 													console.log('Parsed data from worker:', data);
 												})
 												.catch(err => {
 													console.error('Worker error:', err);
 													printer.gcode_information = undefined;
+													slowedUpdateClientPrinterData();
 												});
 												
 												ftp_client.close();
 											}).catch((exception) => {
 												console.log('FTP downloadTo failed', exception);
 												printer.gcode_information = undefined;
+												slowedUpdateClientPrinterData();
+												
 												ftp_client.close();
 											});
 										}
@@ -407,6 +433,8 @@ _.each(PRINTERS, (printer, printer_index) => {
 										{
 											console.log('FTP downlaod to failed', exception);
 											printer.gcode_information = undefined;
+											slowedUpdateClientPrinterData();
+											
 											ftp_client.close();
 										}
 									}
@@ -416,6 +444,7 @@ _.each(PRINTERS, (printer, printer_index) => {
 						{
 							console.log('FTP list failed', exception);
 							printer.gcode_information = undefined;
+							slowedUpdateClientPrinterData();
 						}
 					}
 				}
