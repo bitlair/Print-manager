@@ -1,34 +1,22 @@
 
 import unzipper from 'unzipper';
 import { workerData, parentPort } from 'worker_threads';
-import { readFile } from 'fs/promises';
+import { readFile, writeFile, mkdir } from 'fs/promises';
+import fs from 'fs/promises';
+import fsSync from 'fs';       // <-- synchronous API
 import _ from 'lodash';
-
-function extractPlateGcode(filePath)
-{
-	console.log('extractPlateGcode', filePath);
-	
-    return unzipper.Open.file(filePath).then((directory) => {
-		const file = directory.files.find(file =>
-			file.path.startsWith('Metadata/plate_') && file.path.endsWith('.gcode')
-		);
-		
-		if (!file)
-			throw new Error('plate_1.gcode not found')
-		
-		return file.buffer();
-	}).then((content) => {
-		return content.toString('utf8');
-	});
-}
+import path from 'path';
+import { XMLParser } from "fast-xml-parser";
+import { execFileSync  } from 'child_process';
+import { randomUUID } from 'crypto';
 
 function getGcodeInformationFromHeaders(content)
 {
 	const lines = content.split('\n');
 	const response = {weight: 0, estimated_time: 0};
 	
-	let time_found = false;
-	let weight_found = false;
+	let time_found 		= false;
+	let weight_found 	= false;
 	
 	_.each(lines, (line, index) => {
 		if(line.includes('total estimated time'))
@@ -58,10 +46,6 @@ function getGcodeInformationFromHeaders(content)
 		if(index > 200)
 			return false;
 	});
-	
-	// in case the file is just too small, like a simple circle
-	if(response.weight <= 1 && response.estimated_time > 0)
-		response.weight = 1;
 	
 	return response;
 }
@@ -238,24 +222,208 @@ function sumWeightValues(valueString) {
   return parseFloat(values.reduce((sum, value) => sum + value, 0).toFixed(2));
 }
 
+function getSliceInfo(file_content)
+{
+	const response = {plate: -1, weight: 0, estimated_time: 0};
+	
+	if(!file_content || _.isEmpty(file_content))
+		return response;
+	
+	const xml_file 	= new XMLParser({
+		ignoreAttributes: 		false,
+		attributeNamePrefix: 	"",
+		allowBooleanAttributes: true,
+		isArray: 				(name) => ["metadata", "object", "filament", "warning", "header_item"].includes(name)
+	}).parse(file_content);
+	
+	if(!xml_file)
+		return response;
+	
+	if(!xml_file.config)
+		return response;
+	
+	if(!xml_file.config.plate)
+		return response;
+	
+	const metadata = xml_file.config.plate.metadata;
+	
+	if(!metadata)
+		return response;
+	
+	const properties = _.fromPairs(
+		metadata.map(({ key, value }) => [key, value])
+	);
+	
+	if(properties.index >= 0)
+		response.plate = Number(properties.index);
+	
+	if(properties.prediction >= 0)
+		response.estimated_time = Number(properties.prediction);
+	
+	if(properties.weight >= 0)
+		response.weight = Number(properties.weight);
+	
+	return response;
+}
 
+function unzipFileToTemp(file_path)
+{
+	const guid 		= randomUUID();
+    const outputDir = '/tmp/' + guid + '/';
+	
+    try {
+		// call 7zip to extract the zip file
+        execFileSync(
+            '7z',
+            ['x', file_path, `-o${outputDir}`, '-y'],
+            { stdio: 'inherit' }
+        );
+    } catch (err) {
+        // Ignore errors because we expect CRC warnings / non-zero exit codes
+        console.warn(`7z exited with status ${err.status}, continuing anyway`);
+    }
+	
+	
+    // Check if output directory exists and has files
+    if (!fsSync.existsSync(outputDir)) {
+        throw new Error(`Extraction failed: output directory "${outputDir}" was not created`);
+    }
+	
+	const files = fsSync.readdirSync(outputDir);
+	
+    if (files.length === 0) {
+        throw new Error(`Extraction failed: no files were extracted to "${outputDir}"`);
+    }
+	
+    return outputDir;
+}
+
+function extractSliceInfoContent(tempDirectory)
+{
+	return fs.readFile(tempDirectory + 'Metadata/slice_info.config', 'utf-8');
+}
+
+// there is always only 1 gcode file in
+function extractPlateGcodeContent(tempDirectory, plateIndex)
+{
+	return fs.readdir(tempDirectory + 'Metadata/').then((files) => {
+		let lastGcodeFile = undefined;
+		
+		for (const file of files) {
+			if(file.toLowerCase() == 'plate_' + plateIndex + '.gcode')
+			{
+				return fs.readFile(tempDirectory + '/Metadata/' + file, 'utf-8');
+			}
+			else if(file.toLowerCase().endsWith('.gcode'))
+				lastGcodeFile = file;
+		};
+		
+		if(lastGcodeFile)
+			return fs.readFile(tempDirectory + '/Metadata/' + lastGcodeFile, 'utf-8');
+		
+		return null;
+	});
+}
+
+function extractPlateImages(tempDirectory, plateIndex)
+{
+	const metadataDir = tempDirectory + 'Metadata/';
+	
+	return fs.readdir(metadataDir).then((files) => {
+		// We want the normal plate first then the others in this roder
+		const order = [
+			`plate_${plateIndex}.png`,
+			`plate_${plateIndex}_small.png`,
+			`plate_no_light_${plateIndex}.png`
+		];
+
+		// return the list of files in the order we want or a empty array
+		const readPromises = order
+            .filter(name => files.includes(name))
+            .map(name =>
+                fs.readFile(path.join(metadataDir, name))
+                  .then(buffer => {
+                      if (buffer.length === 0) {
+                          // skip empty files
+                          return null;
+                      }
+                      return {
+                          filename: name,
+                          base64: buffer.toString('base64')
+                      };
+                  })
+            );
+			
+		// Wait for all reads and convert array of [name, base64] pairs into an object
+        return Promise.all(readPromises).then(results => results.filter(Boolean));
+	});
+}
 
 try {
     try {
         console.log('worker initialized');
-		extractPlateGcode(workerData).then((file_content) => {
-			let response_data = getGcodeInformationFromHeaders(file_content);
+		
+		const tempDirectory = unzipFileToTemp(workerData);
+		
+		const finishRequest = (finished_response_data) => {
+			extractPlateImages(tempDirectory, finished_response_data.plate).then(images => {
+				if(!_.isEmpty(images))
+				{
+					finished_response_data.preview_image_base64 = images[0].base64;
+					finished_response_data.available_images 	= images;
+				}
+				
+				// we can't pay for something less then 1 gram, we need a minimum of 1
+				if(finished_response_data.weight <= 1)
+					finished_response_data.weight = 1;
+				
+
+				parentPort.postMessage({ status: true, ...finished_response_data });
+			});
+		}
+		
+		extractSliceInfoContent(tempDirectory).then(slice_info_content => {
+			// lets get the response data from the slice info when available.
+			const response_data 			= {plate: -1, weight: 0, estimated_time: 0};
+			const slice_info_response_data 	= getSliceInfo(slice_info_content);
 			
-			if(response_data.weight < 5 && response_data.estimated_time < 5)
+			// we can always assume to get the default response_data back from the function
+			// just need to make sure its actually something else then default
+			if(slice_info_response_data.plate >= 0)
+				response_data.plate = slice_info_response_data.plate;
+			if(slice_info_response_data.weight > 0)
+				response_data.weight = slice_info_response_data.weight;
+			if(slice_info_response_data.estimated_time > 0)
+				response_data.estimated_time = slice_info_response_data.estimated_time;
+			
+			if(response_data.weight == 0 || response_data.estimated_time == 0)
 			{
-				response_data = getGcodeInformationFromContent(file_content);
-				response_data.parsed_by = 'content';
+				extractPlateGcodeContent(tempDirectory, response_data.plate).then((file_content) => {
+					const header_response_data = getGcodeInformationFromHeaders(file_content);
+					
+					// if we already got a weight or estimated time assume the slice_info is more correct
+					if(response_data.weight == 0 && header_response_data.weight > 0)
+						response_data.weight = header_response_data.weight;
+					if(response_data.estimated_time == 0 && header_response_data.estimated_time > 0)
+						response_data.estimated_time = header_response_data.estimated_time;
+					
+					if(response_data.weight == 0 || response_data.estimated_time == 0)
+					{
+						const content_response_data = getGcodeInformationFromContent(file_content);
+						
+						// if we already got a weight or estimated time assume that those values are more correct
+						if(response_data.weight == 0 && content_response_data.weight > 0)
+							response_data.weight = content_response_data.weight;
+						if(response_data.estimated_time == 0 && content_response_data.estimated_time > 0)
+							response_data.estimated_time = content_response_data.estimated_time;
+					}
+					
+					finishRequest(response_data);
+				});
 			}
 			else
-				response_data.parsed_by = 'headers';
-			
-			parentPort.postMessage({ status: true, ...response_data });
-		})
+				finishRequest(response_data);
+		});
     } catch (error) {
 		console.log(error);
         parentPort.postMessage({ status: false});

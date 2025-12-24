@@ -10,8 +10,11 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "adm-zip": "^0.5.16",
     "bambu-node": "^3.22.21",
     "basic-ftp": "^5.0.5",
+    "chokidar": "^4.0.3",
+    "fast-xml-parser": "^5.3.3",
     "lodash": "^4.17.21",
     "moment": "^2.30.1",
     "mqtt": "^5.11.0",

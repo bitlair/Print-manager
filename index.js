@@ -15,22 +15,16 @@ import { time_to_minutes, is_empty } from './utils.js';
 
 import BitlairBank from './ssh.js';
 import OneWire from './onewire.js';
-
+        
 // disable self cert
 process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = 0; 
 
-// getGcodeInformation('./d1_colored.gcode').then((data) => {
-// 	console.log('d1_colored.gcode', data);
-// });
-
-// getGcodeInformation('./d1_colored.gcode').then((data) => {
-// 	console.log('d1_colored.gcode', data);
-// });
-
-const CLIENT_ID 				= 'nodejs-client-' + Math.random().toString(16).substr(2, 8);
-const TIME_BETWEEN_COMMANDS_MS 	= 100;
-const BITLAIR_BANK 				= new BitlairBank();
-const IBUTTON_READER 			= new OneWire();
+const CLIENT_ID 					= 'nodejs-client-' + Math.random().toString(16).substr(2, 8);
+const TIME_BETWEEN_COMMANDS_MS 		= 100;
+const BITLAIR_BANK 					= new BitlairBank();
+const IBUTTON_READER 				= new OneWire();
+const USE_DUMMY_DATA				= false;
+const PROCESSING_TIMEOUT_SECONDS	= 300; // 5 min
 
 console.log("Starting", isWithinDjoTime() ? " DJO tijd" : "bitlair tijd");
 
@@ -61,15 +55,43 @@ const serveStaticFile = (filePath, res) => {
         });
 };
 
+/*readPrinterFile('./latest_print_3.gcode.3mf').then((gcode_response) => {   
+	console.log('gcode_response', gcode_response);                           
+})*/ 
+
+
 
 const http_server = http.createServer(function (req, res) {
-	// Normalize the request URL to always serve the public folder as root
+    // Enable CORS for all origins (or restrict to your frontend URL)
+    res.setHeader('Access-Control-Allow-Origin', '*'); // or 'http://192.168.2.34:3000'
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    // Handle preflight request
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
+	     
+	// Normalize the request URL
     const requestPath = req.url === '/' ? '/index.html' : req.url;
 
-    // Construct the full file path from the public folder
-    const filePath = path.join(__dirname, 'public', requestPath);
+    let filePath;
+	
+	console.log('requestPath', requestPath);
+	
+    if (requestPath.endsWith('.3mf')) {
+        // Serve 3MF files from ../Print-manager/
+        const fileName = path.basename(requestPath); // extract just the filename
+        filePath = path.join(__dirname, '..', 'Print-manager', fileName);
+    } else {
+        // Serve other files from public folder
+        filePath = path.join(__dirname, 'public', requestPath);
+    }
+
     // Serve the requested file (or 404 if it doesn't exist)
-    serveStaticFile(filePath, res);
+    serveStaticFile(filePath, res);  
 });//.listen(8080); //the server object listens on port 8080
 
 const io = new SocketServer(http_server, {
@@ -91,6 +113,7 @@ let socket_selected_printer_serials = {};
 let last_authenticated_user = undefined;
 
 io.on('connection', socket => {
+	
     console.log('a user connected:', socket.id);
 	
 	socket_selected_printer_serials[socket.id] = undefined;
@@ -107,7 +130,7 @@ io.on('connection', socket => {
 			socket.emit('user authenticated', '-1');
 		}
 	});
-
+	
     socket.on('message', data => {
         console.log('Message received:', data);
         // socket.broadcast.emit('message', data);
@@ -205,7 +228,10 @@ _.each(PRINTERS, (printer, printer_index) => {
 	let total_payload = {};
 	let initialized = false;
 	let refresh_requested = false;
+	let processing_new_print_timeout = undefined;
+	let last_task_id = undefined;
 	
+	printer.processing_new_print = false;
 	printer.last_accepted_md5 = undefined;
 
 	// MQTT connection options for Bambu printer
@@ -219,6 +245,21 @@ _.each(PRINTERS, (printer, printer_index) => {
 
 	const slowedUpdateClientPrinterData = _.throttle(updateClientPrinterData, 2000);
 
+	if(USE_DUMMY_DATA)
+	{
+		if(!printer.gcode_information)
+			readPrinterFile('./latest_print_' + printer_index + '.gcode.3mf').then((data) => {
+				
+				printer.gcode_information 			= data;
+				printer.gcode_information.last_file = "test";
+				printer.last_print = {title: data.filename};
+				
+				slowedUpdateClientPrinterData();                    
+			});
+		printer.last_print = {title: 'test.png'}
+		printer.state = 'RUNNING';
+	}
+	
 	try {
 		// Connect to the printer's MQTT broker
 		printer.mqtt_client = mqtt.connect(`mqtts://${printer.ip}:8883`, options);
@@ -295,7 +336,8 @@ _.each(PRINTERS, (printer, printer_index) => {
 						(
 							printer.gcode_information.last_file != total_payload.print.file && 
 							printer.gcode_information.last_file != total_payload.print.subtask_name
-						)
+						) ||
+						(initialized && total_payload.print.task_id != last_task_id) // also refresh if the task_id has changed
 					)
 				) {  
 					if(total_payload.print.subtask_name)
@@ -319,21 +361,23 @@ _.each(PRINTERS, (printer, printer_index) => {
 									
 									if (matchedFile)
 									{
+										printer.processing_new_print = true;
+										slowedUpdateClientPrinterData();
+										
+										if(processing_new_print_timeout)
+											clearTimeout(processing_new_print_timeout);
+										
+										// timeout just in case there is any failure or it just takes ages for very complex prints
+										processing_new_print_timeout = setTimeout(() => {
+											printer.processing_new_print = false;
+											processing_new_print_timeout = undefined;
+											slowedUpdateClientPrinterData();
+											console.log('Processing timeout reached for printer ', printer.title);
+										}, PROCESSING_TIMEOUT_SECONDS * 1000);
+										
 										try {
 											ftp_client.downloadTo(local_filename, matchedFile.name).then(() => {
-												/*extractPlateGcode(local_filename).then((content) => {
-													const gcode_information = getGcodeInformationFromContent(content);
-													
-													printer.gcode_information 			= gcode_information;
-													printer.gcode_information.last_file = total_payload.print.subtask_name;
-													
-													slowedUpdateClientPrinterData();
-													ftp_client.close();
-												}).catch((exception) => {
-													console.log('FTP extractPlateGcode failed', exception); 
-													printer.gcode_information = undefined;
-													ftp_client.close();
-												});*/
+												console.log('File downloaded for printer ', printer.title);
 												
 												readPrinterFile(local_filename).then(data => {
 													if(data.status)
@@ -341,20 +385,31 @@ _.each(PRINTERS, (printer, printer_index) => {
 														printer.gcode_information 			= data;
 														printer.gcode_information.last_file = total_payload.print.subtask_name;
 														
-														slowedUpdateClientPrinterData();
 													}
+													
+													if(processing_new_print_timeout)
+														clearTimeout(processing_new_print_timeout);
+													
+													printer.processing_new_print = false;
+													processing_new_print_timeout = undefined;
+													slowedUpdateClientPrinterData();
 													
 													console.log('Parsed data from worker:', data);
 												})
 												.catch(err => {
 													console.error('Worker error:', err);
 													printer.gcode_information = undefined;
+													last_task_id = undefined;
+													slowedUpdateClientPrinterData();
 												});
 												
 												ftp_client.close();
 											}).catch((exception) => {
 												console.log('FTP downloadTo failed', exception);
 												printer.gcode_information = undefined;
+												last_task_id = undefined;
+												slowedUpdateClientPrinterData();
+												
 												ftp_client.close();
 											});
 										}
@@ -362,6 +417,9 @@ _.each(PRINTERS, (printer, printer_index) => {
 										{
 											console.log('FTP downlaod to failed', exception);
 											printer.gcode_information = undefined;
+											last_task_id = undefined;
+											slowedUpdateClientPrinterData();
+											
 											ftp_client.close();
 										}
 									}
@@ -371,6 +429,8 @@ _.each(PRINTERS, (printer, printer_index) => {
 						{
 							console.log('FTP list failed', exception);
 							printer.gcode_information = undefined;
+							last_task_id = undefined; 
+							slowedUpdateClientPrinterData();
 						}
 					}
 				}
@@ -387,7 +447,9 @@ _.each(PRINTERS, (printer, printer_index) => {
 				
 				if(total_payload.print.subtask_name);
 					printer.last_print.title = total_payload.print.subtask_name;
-
+				
+				last_task_id = total_payload.print.task_id;
+				
 				slowedUpdateClientPrinterData();
 				
 				// set initialized so we know this is the refreshed data

@@ -1,0 +1,1 @@
+ cmake .. && make && sudo setcap cap_sys_rawio+ep /home/pi/Print-manager/ibutton_reader/build/ibutton_reader && sudo ./ibutton_reader
