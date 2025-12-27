@@ -56,7 +56,7 @@ const serveStaticFile = (filePath, res) => {
 };
 
 /*readPrinterFile('./latest_print_3.gcode.3mf').then((gcode_response) => {   
-	console.log('gcode_response', gcode_response);                           
+	console.log('gcode_response', gcode_response);                              
 })*/ 
 
 
@@ -252,7 +252,7 @@ _.each(PRINTERS, (printer, printer_index) => {
 				
 				printer.gcode_information 			= data;
 				printer.gcode_information.last_file = "test";
-				printer.last_print = {title: data.filename};
+				printer.last_print 					= {title: data.filename};
 				
 				slowedUpdateClientPrinterData();                    
 			});
@@ -384,7 +384,6 @@ _.each(PRINTERS, (printer, printer_index) => {
 													{
 														printer.gcode_information 			= data;
 														printer.gcode_information.last_file = total_payload.print.subtask_name;
-														
 													}
 													
 													if(processing_new_print_timeout)
@@ -856,18 +855,33 @@ function updateClientPrinterData(socket = undefined)
 	});
 }*/
 
+// lets keep track of the amount of workers
+let activeWorkers = 0;
+
 function readPrinterFile(filePath) {
     return new Promise((resolve, reject) => {
         const worker = new Worker(path.resolve(__dirname, 'gcodeParser.js'), {
-            workerData: filePath
+            workerData: {
+				path: filePath,
+				index: activeWorkers
+			},
         });
 
-        worker.on('message', resolve);
-        worker.on('error', reject);
-        worker.on('exit', code => {
-            if (code !== 0)
-                reject(new Error(`Worker stopped with exit code ${code}`));
-        });
+		activeWorkers++;
+
+        worker.once('message', result => {
+			resolve(result);
+			worker.terminate();
+		});
+
+		worker.once('error', err => {
+			reject(err);
+			worker.terminate();
+		});
+
+		worker.once('exit', () => {
+			activeWorkers--;
+		});
     });
 }
 

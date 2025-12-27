@@ -272,12 +272,11 @@ function unzipFileToTemp(file_path)
     const outputDir = '/tmp/' + guid + '/';
 	
     try {
-		// call 7zip to extract the zip file
-        execFileSync(
-            '7z',
-            ['x', file_path, `-o${outputDir}`, '-y'],
-            { stdio: 'inherit' }
-        );
+		execFileSync(
+			'7z',
+			['x', file_path, `-o${outputDir}`, '-y', '-bb3'],
+			{ stdio: 'inherit' }
+		);
     } catch (err) {
         // Ignore errors because we expect CRC warnings / non-zero exit codes
         console.warn(`7z exited with status ${err.status}, continuing anyway`);
@@ -333,8 +332,10 @@ function extractPlateImages(tempDirectory, plateIndex)
 		// We want the normal plate first then the others in this roder
 		const order = [
 			`plate_${plateIndex}.png`,
-			`plate_${plateIndex}_small.png`,
-			`plate_no_light_${plateIndex}.png`
+			// `plate_${plateIndex}_small.png`,
+			// `plate_no_light_${plateIndex}.png`,
+			`top_${plateIndex}.png`,
+			// `pick_${plateIndex}.png`
 		];
 
 		// return the list of files in the order we want or a empty array
@@ -361,69 +362,73 @@ function extractPlateImages(tempDirectory, plateIndex)
 
 try {
     try {
-        console.log('worker initialized');
+        console.log('worker initialized: ', workerData);
 		
-		const tempDirectory = unzipFileToTemp(workerData);
-		
-		const finishRequest = (finished_response_data) => {
-			extractPlateImages(tempDirectory, finished_response_data.plate).then(images => {
-				if(!_.isEmpty(images))
-				{
-					finished_response_data.preview_image_base64 = images[0].base64;
-					finished_response_data.available_images 	= images;
-				}
-				
-				// we can't pay for something less then 1 gram, we need a minimum of 1
-				if(finished_response_data.weight <= 1)
-					finished_response_data.weight = 1;
-				
+		// sometimes the file system lags behind and isn't ready for the file to be properly used
+		// this happends usually when more then 1 printer is sending data
+		// every worker index is delayed by 30 sec to give the others time to finish first
+		setTimeout(() => {
+			const tempDirectory = unzipFileToTemp(workerData.path);
 
-				parentPort.postMessage({ status: true, ...finished_response_data });
-			});
-		}
-		
-		extractSliceInfoContent(tempDirectory).then(slice_info_content => {
-			// lets get the response data from the slice info when available.
-			const response_data 			= {plate: -1, weight: 0, estimated_time: 0};
-			const slice_info_response_data 	= getSliceInfo(slice_info_content);
-			
-			// we can always assume to get the default response_data back from the function
-			// just need to make sure its actually something else then default
-			if(slice_info_response_data.plate >= 0)
-				response_data.plate = slice_info_response_data.plate;
-			if(slice_info_response_data.weight > 0)
-				response_data.weight = slice_info_response_data.weight;
-			if(slice_info_response_data.estimated_time > 0)
-				response_data.estimated_time = slice_info_response_data.estimated_time;
-			
-			if(response_data.weight == 0 || response_data.estimated_time == 0)
-			{
-				extractPlateGcodeContent(tempDirectory, response_data.plate).then((file_content) => {
-					const header_response_data = getGcodeInformationFromHeaders(file_content);
-					
-					// if we already got a weight or estimated time assume the slice_info is more correct
-					if(response_data.weight == 0 && header_response_data.weight > 0)
-						response_data.weight = header_response_data.weight;
-					if(response_data.estimated_time == 0 && header_response_data.estimated_time > 0)
-						response_data.estimated_time = header_response_data.estimated_time;
-					
-					if(response_data.weight == 0 || response_data.estimated_time == 0)
+			const finishRequest = (finished_response_data) => {
+				extractPlateImages(tempDirectory, finished_response_data.plate).then(images => {
+					if(!_.isEmpty(images))
 					{
-						const content_response_data = getGcodeInformationFromContent(file_content);
-						
-						// if we already got a weight or estimated time assume that those values are more correct
-						if(response_data.weight == 0 && content_response_data.weight > 0)
-							response_data.weight = content_response_data.weight;
-						if(response_data.estimated_time == 0 && content_response_data.estimated_time > 0)
-							response_data.estimated_time = content_response_data.estimated_time;
+						finished_response_data.preview_image_base64 = images[0].base64;
+						finished_response_data.available_images 	= images;
 					}
 					
-					finishRequest(response_data);
+					// we can't pay for something less then 1 gram, we need a minimum of 1
+					if(finished_response_data.weight <= 1)
+						finished_response_data.weight = 1;
+					
+					parentPort.postMessage({ status: true, ...finished_response_data });
 				});
 			}
-			else
-				finishRequest(response_data);
-		});
+			
+			extractSliceInfoContent(tempDirectory).then(slice_info_content => {
+				// lets get the response data from the slice info when available.
+				const response_data 			= {plate: -1, weight: 0, estimated_time: 0};
+				const slice_info_response_data 	= getSliceInfo(slice_info_content);
+				
+				// we can always assume to get the default response_data back from the function
+				// just need to make sure its actually something else then default
+				if(slice_info_response_data.plate >= 0)
+					response_data.plate = slice_info_response_data.plate;
+				if(slice_info_response_data.weight > 0)
+					response_data.weight = slice_info_response_data.weight;
+				if(slice_info_response_data.estimated_time > 0)
+					response_data.estimated_time = slice_info_response_data.estimated_time;
+				
+				if(response_data.weight == 0 || response_data.estimated_time == 0)
+				{
+					extractPlateGcodeContent(tempDirectory, response_data.plate).then((file_content) => {
+						const header_response_data = getGcodeInformationFromHeaders(file_content);
+						
+						// if we already got a weight or estimated time assume the slice_info is more correct
+						if(response_data.weight == 0 && header_response_data.weight > 0)
+							response_data.weight = header_response_data.weight;
+						if(response_data.estimated_time == 0 && header_response_data.estimated_time > 0)
+							response_data.estimated_time = header_response_data.estimated_time;
+						
+						if(response_data.weight == 0 || response_data.estimated_time == 0)
+						{
+							const content_response_data = getGcodeInformationFromContent(file_content);
+							
+							// if we already got a weight or estimated time assume that those values are more correct
+							if(response_data.weight == 0 && content_response_data.weight > 0)
+								response_data.weight = content_response_data.weight;
+							if(response_data.estimated_time == 0 && content_response_data.estimated_time > 0)
+								response_data.estimated_time = content_response_data.estimated_time;
+						}
+						
+						finishRequest(response_data);
+					});
+				}
+				else
+					finishRequest(response_data);
+			});
+		}, (workerData.index * 30000) + 2000);
     } catch (error) {
 		console.log(error);
         parentPort.postMessage({ status: false});
