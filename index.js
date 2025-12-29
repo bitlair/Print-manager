@@ -229,8 +229,8 @@ _.each(PRINTERS, (printer, printer_index) => {
 	let initialized = false;
 	let refresh_requested = false;
 	let processing_new_print_timeout = undefined;
-	let last_task_id = undefined;
-	
+	let last_loaded_md5 = undefined;
+
 	printer.processing_new_print = false;
 	printer.last_accepted_md5 = undefined;
 
@@ -267,6 +267,8 @@ _.each(PRINTERS, (printer, printer_index) => {
 		printer.mqtt_client.on('connect', () => {
 			console.log('✅ Connected to printer MQTT!');
 
+			printer.state = "IDLE"; // initial state
+
 			const topic = `device/${printer.serial}/report`; // This is the standard topic
 
 			printer.mqtt_client.subscribe(topic, (err) => {
@@ -282,12 +284,19 @@ _.each(PRINTERS, (printer, printer_index) => {
 			});
 		});
 
+		printer.mqtt_client.on('disconnect', () => {
+			console.log("Printer disconnected: ", printer);
+		});
+
 		printer.mqtt_client.on('message', (topic, message) => {
 			try {
 				const payload = JSON.parse(message.toString()); 
 				
 				//payload comes in with only changes every time, not the full payload
 				total_payload = _.merge(total_payload, payload);
+				
+				// if(printer_index == 2)
+				// 	console.log(total_payload.print);
 				
 				if(isWithinDjoTime())
 				{
@@ -328,18 +337,21 @@ _.each(PRINTERS, (printer, printer_index) => {
 					}
 				}
 				
+				if(printer_index == 2)
+					console.log("MD5 LAST_PRINT", printer.last_print?.md5, " || CURRENT ", last_loaded_md5, "CAN EXECUTE? ", (printer.last_print && printer.last_print.md5 != last_loaded_md5), (total_payload.print.gcode_state == "FINISH" || total_payload.print.gcode_state == "RUNNING" || !initialized));
+
 				// todo check when a new print is executed
 				if(
 					(total_payload.print.gcode_state == "FINISH" || total_payload.print.gcode_state == "RUNNING" || !initialized) &&
 					(
 						!printer.gcode_information ||
-						(
-							printer.gcode_information.last_file != total_payload.print.file && 
-							printer.gcode_information.last_file != total_payload.print.subtask_name
-						) ||
-						(initialized && total_payload.print.task_id != last_task_id) // also refresh if the task_id has changed
+						printer.gcode_information.last_file != total_payload.print.subtask_name ||
+						(printer.last_print && printer.last_print.md5 != last_loaded_md5)
 					)
-				) {  
+				) { 
+					// setting the last loaded md5 so it won't trigger a reload of the file
+					last_loaded_md5 = total_payload.print.md5;
+					
 					if(total_payload.print.subtask_name)
 					{
 						const local_filename = './latest_print_' + printer_index + '.gcode.3mf';
@@ -398,7 +410,7 @@ _.each(PRINTERS, (printer, printer_index) => {
 												.catch(err => {
 													console.error('Worker error:', err);
 													printer.gcode_information = undefined;
-													last_task_id = undefined;
+													last_loaded_md5 = undefined;
 													slowedUpdateClientPrinterData();
 												});
 												
@@ -406,7 +418,7 @@ _.each(PRINTERS, (printer, printer_index) => {
 											}).catch((exception) => {
 												console.log('FTP downloadTo failed', exception);
 												printer.gcode_information = undefined;
-												last_task_id = undefined;
+												last_loaded_md5 = undefined;
 												slowedUpdateClientPrinterData();
 												
 												ftp_client.close();
@@ -416,7 +428,7 @@ _.each(PRINTERS, (printer, printer_index) => {
 										{
 											console.log('FTP downlaod to failed', exception);
 											printer.gcode_information = undefined;
-											last_task_id = undefined;
+											last_loaded_md5 = undefined;
 											slowedUpdateClientPrinterData();
 											
 											ftp_client.close();
@@ -428,7 +440,7 @@ _.each(PRINTERS, (printer, printer_index) => {
 						{
 							console.log('FTP list failed', exception);
 							printer.gcode_information = undefined;
-							last_task_id = undefined; 
+							last_loaded_md5 = undefined; 
 							slowedUpdateClientPrinterData();
 						}
 					}
@@ -446,8 +458,6 @@ _.each(PRINTERS, (printer, printer_index) => {
 				
 				if(total_payload.print.subtask_name);
 					printer.last_print.title = total_payload.print.subtask_name;
-				
-				last_task_id = total_payload.print.task_id;
 				
 				slowedUpdateClientPrinterData();
 				
@@ -482,6 +492,8 @@ _.each(PRINTERS, (printer, printer_index) => {
 		});
 		printer.mqtt_client.on('error', (err) => {
 			console.error('❌ MQTT Error:', err.message);
+			
+			printer.state = "OFFLINE"; // initial state
 		});
 	} catch(exception) {
 		console.log('failed to create mqtt client: ', printer);
